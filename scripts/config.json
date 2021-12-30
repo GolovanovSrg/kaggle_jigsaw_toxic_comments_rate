@@ -1,0 +1,35 @@
+{
+    "model": {"model_type": "gpt2_small",
+              "vocab_dir": "./vocab",
+              "parameters_dir": "./weights",
+              "n_targets": 1,
+              "dropout": 0.0,
+              "embedding_dropout": 0.0,
+              "attn_dropout": 0.0,
+              "ff_dropout": 0.0,
+              "adapters": true,
+              "adapters_size": 32},
+
+    "datasets": {"train_dataset": {"path": "/media/golovanov/74b0c986-d950-458d-907c-8205cf9a8bbe/kaggle/jigsaw/train.csv",
+                                   "bpe_dropout": 0,
+                                   "max_positions": 256,
+                                   "balanced": true},
+                 "test_dataset": {"path": "/media/golovanov/74b0c986-d950-458d-907c-8205cf9a8bbe/kaggle/jigsaw/validation_data.csv",
+                                  "bpe_dropout": 0,
+                                  "max_positions": 256}},
+
+    "trainer": {"optimizer_params": {"lr": 1e-4, "weight_decay": 0.1, "gamma": 1, "warmup": 5000},
+                "loss_params": {"trg_weight": 1, "lm_weight": 0.1, "smoothing": 0.1},
+                "clip_grad_norm": 1,
+                "tb_dir": null,
+                "device": "cuda:0",
+                "n_jobs": 16,
+                "seed": 0},
+
+    "train_process": {"n_epochs": 100,
+                      "batch_size": 16,
+                      "test_batch_size": 16,
+                      "test_each": 5,
+                      "last_checkpoint_path": "./checkpoints/last_checkpoint.pt",
+                      "best_checkpoint_path": "./checkpoints/best_checkpoint.pt"}
+}
