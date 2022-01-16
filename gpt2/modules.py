@@ -3,6 +3,13 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+
+try:
+    from apex.normalization import FusedLayerNorm as LayerNorm
+except ImportError:
+    print("Better speed can be achieved with apex installed from https://www.github.com/nvidia/apex.")
+    from torch.nn import LayerNorm
 
 
 class LearnablePositionalEmbedding(nn.Embedding):
@@ -32,15 +39,24 @@ class CombinedEmbedding(nn.Module):
     def _init_weights(self):
         nn.init.normal_(self.tok_embedding.weight, std=0.02)
 
-    def forward(self, x):
-        padding_mask = x[:, :].eq(self.tok_padding_idx)
+    def get_token_embeddings(self, x):
+        embeddings = self.tok_embedding(x)
+        padding_mask = x.eq(self.tok_padding_idx)
+        return embeddings, padding_mask
+
+    def get_position_embeddings(self, padding_mask):
         positions = torch.cumsum(~padding_mask, dim=-1, dtype=torch.long)
         positions.masked_fill_(padding_mask, self.pos_padding_idx)
+        position_emb = self.pos_embedding(positions)
 
-        x = self.tok_embedding(x) + self.pos_embedding(positions)
-        x = self.dropout(x)
+        return position_emb
 
-        return x, padding_mask
+    def forward(self, x):
+        tok_emb, pad_mask = self.get_token_embeddings(x)
+        pos_emb = self.get_position_embeddings(pad_mask)
+        emb = self.dropout(tok_emb + pos_emb)
+
+        return emb, pad_mask
 
 
 class SelfMultiheadAttention(nn.Module):
@@ -82,11 +98,11 @@ class SelfMultiheadAttention(nn.Module):
         w = torch.matmul(q, k) / math.sqrt(self.n_features // self.n_heads)
 
         if self.future_mask:
-            future_mask = self._get_future_mask(w.shape[-2:], w.device).unsqueeze(0).unsqueeze(0)
+            future_mask = self._get_future_mask(w.shape[-2:], w.device)[None, None]
             w.masked_fill_(future_mask, float('-inf'))
 
         if padding_mask is not None:
-            w.masked_fill_(padding_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+            w.masked_fill_(padding_mask[:, None, None], float('-inf'))
 
         w = F.softmax(w, dim=-1)
         w = self.dropout(w)
@@ -108,7 +124,7 @@ class SelfMultiheadAttention(nn.Module):
         key = self._split_heads(key, is_key=True)
         value = self._split_heads(value)
 
-        x = self._attn(query, key, value, padding_mask)
+        x = checkpoint(self._attn, query, key, value, padding_mask)
         x = self._merge_heads(x)
 
         x = self.out_proj(x)
@@ -121,7 +137,7 @@ class FeedForward(nn.Module):
         super().__init__()
 
         self.layer_1 = nn.Linear(in_features, middle_features)
-        self.activatin = nn.GELU()
+        self.activation = nn.GELU()
         self.layer_2 = nn.Linear(middle_features, in_features)
         self.dropout = nn.Dropout(dropout)
 
@@ -135,7 +151,7 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         x = self.layer_1(x)
-        x = self.activatin(x)
+        x = self.activation(x)
         x = self.dropout(x)
         x = self.layer_2(x)
 
@@ -147,12 +163,13 @@ class Adapter(nn.Module):
     https://arxiv.org/pdf/1902.00751.pdf
     """
 
-    def __init__(self, in_features, middle_features):
+    def __init__(self, in_features, middle_features, dropout):
         super().__init__()
 
         self.layer_1 = nn.Linear(in_features, middle_features)
         self.activation = nn.GELU()
         self.layer_2 = nn.Linear(middle_features, in_features)
+        self.dropout = nn.Dropout(dropout)
 
         self._init_weights()
 
@@ -167,6 +184,7 @@ class Adapter(nn.Module):
 
         x = self.layer_1(x)
         x = self.activation(x)
+        x = self.dropout(x)
         x = self.layer_2(x)
 
         x = residual + x
@@ -174,23 +192,47 @@ class Adapter(nn.Module):
         return x
 
 
+def drop_path(x, drop_prob=0, training=False):
+    if drop_prob == 0. or not training:
+        return x
+
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()  # binarize
+    output = x.div(keep_prob) * random_tensor
+
+    return output
+
+
+class DropPath(nn.Module):
+    def __init__(self, drop_prob=None):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
+
+
 class TransformerBlock(nn.Module):
-    def __init__(self, n_features, n_heads, dropout=0, attn_dropout=0, ff_dropout=0,
-                 future_mask=True, adapters=False, adapters_size=None):
+    def __init__(self, n_features, n_heads, dropout=0, attn_dropout=0, ff_dropout=0, drop_path=0,
+                 future_mask=True, adapters_dropout=0, adapters=False, adapters_size=None):
         super().__init__()
 
         if adapters_size is None:
             adapters_size = n_features
 
-        self.attn_norm = nn.LayerNorm(n_features)
+        self.attn_norm = LayerNorm(n_features)
         self.attn = SelfMultiheadAttention(n_features, n_heads, attn_dropout, future_mask)
         self.attn_dropout = nn.Dropout(dropout)
-        self.attn_adapter = Adapter(n_features, adapters_size) if adapters else None
+        self.attn_adapter = Adapter(n_features, adapters_size, adapters_dropout) if adapters else None
 
-        self.ff_norm = nn.LayerNorm(n_features)
+        self.ff_norm = LayerNorm(n_features)
         self.ff = FeedForward(n_features, 4 * n_features, ff_dropout)
         self.ff_dropout = nn.Dropout(dropout)
-        self.ff_adapter = Adapter(n_features, adapters_size) if adapters else None
+        self.ff_adapter = Adapter(n_features, adapters_size, adapters_dropout) if adapters else None
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
     def _process_attn(self, x, padding_mask):
         residual = x
@@ -202,6 +244,7 @@ class TransformerBlock(nn.Module):
         if self.attn_adapter is not None:
             x = self.attn_adapter(x)
 
+        x = self.drop_path(x)
         x = residual + x
 
         return x
@@ -216,6 +259,7 @@ class TransformerBlock(nn.Module):
         if self.ff_adapter is not None:
             x = self.ff_adapter(x)
 
+        x = self.drop_path(x)
         x = residual + x
 
         return x
@@ -229,8 +273,8 @@ class TransformerBlock(nn.Module):
 
 class Transformer(nn.Module):
     def __init__(self, n_layers, n_embeddings, n_pos_embeddings, embedding_dim, padding_idx, n_heads,
-                 dropout=0, embedding_dropout=0, attn_dropout=0, ff_dropout=0, adapters=False,
-                 adapters_size=None):
+                 dropout=0, embedding_dropout=0, attn_dropout=0, ff_dropout=0, drop_path=0,
+                 adapters_dropout=0, adapters=False, adapters_size=None):
         super().__init__()
 
         self.embedding = CombinedEmbedding(n_embeddings=n_embeddings,
@@ -239,19 +283,22 @@ class Transformer(nn.Module):
                                            dropout=embedding_dropout,
                                            padding_idx=padding_idx)
 
+        dpr = [x.item() for x in torch.linspace(0, drop_path, n_layers)]
         self.layers = nn.ModuleList()
-        for _ in range(n_layers):
+        for i in range(n_layers):
             layer = TransformerBlock(n_features=embedding_dim,
                                      n_heads=n_heads,
                                      dropout=dropout,
                                      attn_dropout=attn_dropout,
                                      ff_dropout=ff_dropout,
+                                     drop_path=dpr[i],
                                      future_mask=True,
+                                     adapters_dropout=adapters_dropout,
                                      adapters=adapters,
                                      adapters_size=adapters_size)
             self.layers.append(layer)
 
-        self.final_norm = nn.LayerNorm(embedding_dim)
+        self.final_norm = LayerNorm(embedding_dim)
 
         if adapters:
             self.requires_grad_(False)
@@ -262,13 +309,18 @@ class Transformer(nn.Module):
                 layer.ff_adapter.requires_grad_(True)
             self.final_norm.requires_grad_(True)
 
-    def forward(self, x, return_lm_logits=False):
-        x, padding_mask = self.embedding(x)
+    def transformer_layers(self, x, padding_mask, return_lm_logits=False):
         for layer in self.layers:
             x = layer(x, padding_mask)
         x = self.final_norm(x)
 
         if return_lm_logits:
             lm_logits = F.linear(x, self.embedding.tok_embedding.weight)
-            return x, lm_logits, padding_mask
-        return x, padding_mask
+            return x, lm_logits
+        return x
+
+    def forward(self, x, return_lm_logits=False):
+        x, padding_mask = self.embedding(x)
+        out = self.transformer_layers(x, padding_mask, return_lm_logits)
+
+        return out, padding_mask
