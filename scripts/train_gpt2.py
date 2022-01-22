@@ -11,7 +11,7 @@ sys.path.append('../')
 
 from gpt2 import (MODEL_INFO, get_vocab, load_gpt_weights, prepare_bpe_codes,
                   prepare_bpe_vocab, prepare_gpt_weights)
-from training.model import RegressionModel
+from training.model import AdaptersModel, PromptModel
 from training.datasets import ToxicTextsDataset, RangingToxicTextsDataset
 from training.trainer import Trainer
 
@@ -30,10 +30,10 @@ def get_model_vocab(config):
     model_config = MODEL_INFO[model_type]['config']
     model_config.pop('n_embeddings')
 
-    model = RegressionModel(n_embeddings=len(vocab),
-                            padding_idx=vocab.pad_id,
-                            **config,
-                            **model_config)
+    model = AdaptersModel(n_embeddings=len(vocab),
+                          padding_idx=vocab.pad_id,
+                          **config,
+                          **model_config)
 
     if parameters_dir is not None:
         parameters_path = os.path.join(parameters_dir, model_type + '_parameters.pt')
