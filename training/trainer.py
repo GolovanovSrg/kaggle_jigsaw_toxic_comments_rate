@@ -3,6 +3,7 @@ import random
 
 import torch as t
 import torch.nn.functional as F
+import torchsort
 from torch.nn.utils.rnn import pad_sequence
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
@@ -30,9 +31,33 @@ class Trainer:
 
         return loss
 
+    @staticmethod
+    def _margin_rank_loss(preds, targets, margin):
+        dists = preds.view(-1, 1) - preds.view(1, -1)
+        mult = 2 * (targets.view(-1, 1) >= targets.view(1, -1)).float() - 1
+        loss = (margin - mult * dists).clamp(min=0).triu(diagonal=1).mean()
+
+        return loss
+
+    # @staticmethod
+    # def _soft_rank_loss(pred, target):
+    #     pred_ranks = [torchsort.soft_rank(pred.view(1, -1), regularization='l2', regularization_strength=r)
+    #                   for r in [1, 0.5, 0.1, 0.05, 0.01]]
+
+    #     tmp = target.view(1, -1).argsort()
+    #     target_ranks = t.zeros_like(tmp)
+    #     target_ranks[:, tmp] = t.arange(1, target_ranks.shape[-1] + 1, device=target_ranks.device)
+
+    #     n = target_ranks.shape[-1]
+    #     mse_diffs = sum([(target_ranks - p).pow(2).sum() for p in pred_ranks], 0) / len(pred_ranks)
+    #     upper = 6 * mse_diffs
+    #     down = n * (n ** 2 - 1.0)
+    #     loss = upper / down - 1
+
+    #     return loss
 
     def __init__(self, model, optimizer_params={}, loss_params={}, clip_grad_norm=None,
-                 tb_dir=None, device=None, n_jobs=1, seed=0):
+                 tb_dir=None, n_chunks=1, device=None, n_jobs=1, seed=0):
         self._set_seed(seed)
 
         if device is None:
@@ -42,10 +67,10 @@ class Trainer:
 
         self.model = model.to(device)
 
-        trg_weight = loss_params.get('trg_weight', 1)
+        margin = loss_params.get('margin', 1)
         lm_weight = loss_params.get('lm_weight', 0)
         smoothing = loss_params.get('smoothing', 0)
-        self.trg_criterion = lambda *args: trg_weight * F.mse_loss(*args)
+        self.trg_criterion = lambda *args: self._margin_rank_loss(*args, margin=margin)
         self.lm_criterian = lambda *args: t.tensor([0], dtype=t.float, device=device, requires_grad=True)
         if lm_weight > 0:
             self.lm_criterian = lambda *args: lm_weight * self._label_smooth_loss(*args, smoothing=smoothing)
@@ -62,6 +87,7 @@ class Trainer:
 
         self.writer = SummaryWriter(log_dir=tb_dir)
 
+        self.n_chunks = n_chunks
         self.device = device
         self.n_jobs = n_jobs
 
@@ -73,22 +99,24 @@ class Trainer:
 
         trg_loss, lm_loss = AvgValue(), AvgValue()
         for tokens, targets in tqdm_train_dataloader:
-            tokens = tokens.to(self.device)
-            targets = targets.to(self.device)
-            preds, lm_logits, padding_mask = self.model(tokens)
-
-            batch_trg_loss = self.trg_criterion(preds, targets)
-            batch_lm_loss = self.lm_criterian(lm_logits[:, :-1], tokens[:, 1:], padding_mask[:, 1:])
-
             self.optimizer.zero_grad()
-            (batch_trg_loss + batch_lm_loss).backward()
+
+            tokens, targets = tokens.to(self.device), targets.to(self.device)
+            chunks = zip(tokens.chunk(self.n_chunks), targets.chunk(self.n_chunks))
+            for tokens_chunk, targets_chunk in chunks:
+                preds, lm_logits, padding_mask = self.model(tokens_chunk)
+                chunk_trg_loss = self.trg_criterion(preds, targets_chunk)
+                chunk_lm_loss = self.lm_criterian(lm_logits[:, :-1], tokens_chunk[:, 1:], padding_mask[:, 1:])
+                chunk_loss = (chunk_trg_loss + chunk_lm_loss) / self.n_chunks
+                chunk_loss.backward()
+
+                trg_loss.update(chunk_trg_loss.item())
+                lm_loss.update(chunk_lm_loss.item())
+
             if self.clip_grad_norm is not None:
                 t.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
             self.optimizer.step()
             self.scheduler.step()
-
-            trg_loss.update(batch_trg_loss.item())
-            lm_loss.update(batch_lm_loss.item())
 
             tqdm_train_dataloader.set_postfix({'trg_loss': trg_loss.get(),
                                                'lm_loss': lm_loss.get()})
@@ -114,7 +142,7 @@ class Trainer:
 
             tqdm_test_dataloader.set_postfix({'rng_acc': sum(all_preds, 0) / len(all_preds)})
 
-        self.writer.add_scalar('test/rng_acc', sum(all_preds, 0) / len(all_preds), global_step=self.last_epoch)
+        self.writer.add_scalar('test/rank_acc', sum(all_preds, 0) / len(all_preds), global_step=self.last_epoch)
 
         result_metric = sum(all_preds, 0) / len(all_preds)
 
